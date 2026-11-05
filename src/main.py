@@ -1,7 +1,8 @@
-"""Stage 3: discover catalogue pages and extract provenance-aware raw book records."""
+"""Stages 3-4: discover, extract, clean, validate and store book records."""
 from __future__ import annotations
 
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,10 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import ValidationError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from schema import Book, clean_record  # noqa: E402
 
 BASE_URL = "https://books.toscrape.com/"
 ALLOWED_HOST = "books.toscrape.com"
@@ -22,6 +27,7 @@ USER_AGENT = (
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 CACHE_DIR = PROJECT_DIR / "cache"
 RAW_DIR = PROJECT_DIR / "data" / "raw"
+OUTPUT_DIR = PROJECT_DIR / "output"
 _last_network_request_at: float | None = None
 
 
@@ -121,9 +127,9 @@ def discover_catalogue(max_pages: int = 3) -> tuple[int, list[tuple[str, str]]]:
     return page_count, unique_pairs
 
 
-def extract_raw_record(html: bytes, product_url: str, source_page: str) -> dict:
+def extract_raw_record(html: bytes, product_url: str, source_page: str, fetched_at: str) -> dict:
     """Extract the required eight fields from the book's product area."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "html.parser", from_encoding="utf-8")
     product = soup.select_one("article.product_page")
     if product is None:
         raise ValueError("Product area article.product_page was not found")
@@ -162,13 +168,20 @@ def extract_raw_record(html: bytes, product_url: str, source_page: str) -> dict:
         "rating_text": rating_words[0],
         "description": description,
         "source_page": source_page,
-        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "fetched_at": fetched_at,
     }
+
+
+def fetched_at_for(cache_file: Path) -> str:
+    """Stable timestamp = when the page was cached, so re-runs give identical output."""
+    ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc)
+    return ts.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def main() -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     catalogue_pages, book_pairs = discover_catalogue(max_pages=3)
     records: list[dict] = []
@@ -181,7 +194,7 @@ def main() -> int:
             errors.append({"product_url": product_url, "error": "Detail page fetch failed"})
             continue
         try:
-            records.append(extract_raw_record(html, product_url, source_page))
+            records.append(extract_raw_record(html, product_url, source_page, fetched_at_for(detail_cache)))
         except (ValueError, AttributeError, IndexError) as exc:
             errors.append({"product_url": product_url, "error": str(exc)})
             print(f"EXTRACT FAILED {product_url}: {exc}")
@@ -190,15 +203,40 @@ def main() -> int:
     output_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
     (RAW_DIR / "errors.json").write_text(json.dumps(errors, indent=2), encoding="utf-8")
 
+    # Clean + validate; identity is the canonical product_url, so a repeat counts once.
+    good: dict[str, dict] = {}
+    invalid: list[dict] = []
+    for raw in records:
+        try:
+            book = Book(**clean_record(raw))
+        except (ValidationError, ValueError) as exc:
+            reason = (
+                "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+                if isinstance(exc, ValidationError) else str(exc)
+            )
+            invalid.append({"product_url": raw.get("product_url"), "error": reason, "record": raw})
+            continue
+        good.setdefault(book.product_url, book.model_dump())
+
+    books = sorted(good.values(), key=lambda b: b["product_url"])
+    all_errors = errors + invalid
+
+    # Files are rewritten from scratch each run (never appended) -> idempotent.
+    (OUTPUT_DIR / "books.json").write_text(
+        json.dumps(books, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (OUTPUT_DIR / "errors.json").write_text(
+        json.dumps(all_errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
     print(f"detail_pages={len(records)}")
     print(f"raw_records={len(records)}")
-    print(f"errors={len(errors)}")
-    if records:
-        print("SAMPLE RAW RECORD:")
-        print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    print(f"valid_books={len(books)}")
+    print(f"errors={len(all_errors)}")
+    if books:
+        print("SAMPLE BOOK:")
+        print(json.dumps(books[0], indent=2, ensure_ascii=False))
 
     # Exit nonzero when the checkpoint was not actually achieved.
-    return 0 if catalogue_pages == 3 and len(records) == 60 and not errors else 1
+    return 0 if catalogue_pages == 3 and len(books) == 60 and not all_errors else 1
 
 
 if __name__ == "__main__":
