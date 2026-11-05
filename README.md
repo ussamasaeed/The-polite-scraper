@@ -1,6 +1,6 @@
 # The-polite-scraper
 
-## Stage 3 — Extract raw book records
+### Stage 3 — Extract raw book records
 
 The crawler follows the catalogue's own Next link for at most three pages, resolves product links with `urllib.parse.urljoin`, and removes duplicates. Each product page is fetched once and cached under `cache/details/`. Cache hits do not contact the website and do not incur a delay.
 
