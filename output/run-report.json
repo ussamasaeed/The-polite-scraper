@@ -1,0 +1,12 @@
+{
+  "start_time": "2026-11-05T04:40:49Z",
+  "duration_seconds": 19.59,
+  "catalogue_pages": 3,
+  "pages_fetched": 9,
+  "cache_hits": 54,
+  "retries": 0,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 0,
+  "crashed": null
+}
