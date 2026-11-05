@@ -192,131 +192,42 @@ def extract_raw_record(html: bytes, product_url: str, source_page: str, fetched_
         "rating_text": rating_words[0],
         "description": description,
         "source_page": source_page,
-        "fetched_at": fetched_at,
+        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
 
-def fetched_at_for(cache_file: Path) -> str:
-    """Stable timestamp = when the page was cached, so re-runs give identical output."""
-    ts = datetime.fromtimestamp(cache_file.stat().st_mtime, tz=timezone.utc)
-    return ts.isoformat(timespec="seconds").replace("+00:00", "Z")
+def main() -> int:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="The polite scraper")
-    parser.add_argument(
-        "--extra-url", action="append", default=[],
-        help="Add an extra product URL to the list (repeatable); used to test failure handling.",
-    )
-    return parser.parse_args(argv)
-
-
-def write_report(started: datetime, t0: float, valid: int, invalid: int,
-                 failed: int, catalogue_pages: int, crashed: str | None) -> None:
-    report = {
-        "start_time": started.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "duration_seconds": round(time.monotonic() - t0, 2),
-        "catalogue_pages": catalogue_pages,
-        "pages_fetched": STATS["pages_fetched"],
-        "cache_hits": STATS["cache_hits"],
-        "retries": STATS["retries"],
-        "valid_records": valid,
-        "invalid_records": invalid,
-        "failed_pages": failed,
-        "crashed": crashed,
-    }
-    (OUTPUT_DIR / "run-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print("RUN REPORT:", json.dumps(report))
-
-
-def process_books(book_pairs: list[tuple[str, str]]):
-    """Handle every book page on its own: one bad page is logged and skipped."""
+    catalogue_pages, book_pairs = discover_catalogue(max_pages=3)
     records: list[dict] = []
     failures: list[dict] = []
     for index, (product_url, source_page) in enumerate(book_pairs, start=1):
         detail_cache = CACHE_DIR / "details" / f"book-{index:03d}.html"
-        try:
-            html = fetch_or_cache(product_url, detail_cache)
-            if html is None:
-                failures.append({"product_url": product_url, "stage": "fetch",
-                                 "error": LAST_ERROR or "Detail page fetch failed"})
-                continue
-            records.append(extract_raw_record(html, product_url, source_page, fetched_at_for(detail_cache)))
-        except Exception as exc:  # noqa: BLE001 - isolate every page, whatever goes wrong
-            failures.append({"product_url": product_url, "stage": "extract",
-                             "error": f"{type(exc).__name__}: {exc}"})
-            print(f"PAGE FAILED {product_url}: {exc}")
-    return records, failures
-
-
-def run(extra_urls: list[str], state: dict) -> int:
-    catalogue_pages, book_pairs = discover_catalogue(max_pages=3)
-    state["catalogue_pages"] = catalogue_pages
-    seen = {u for u, _ in book_pairs}
-    for url in extra_urls:
-        if url not in seen:
-            seen.add(url)
-            book_pairs.append((url, "manual"))
-            print(f"EXTRA URL ADDED: {url}")
-
-    records, failures = process_books(book_pairs)
-    state["failed"] = len(failures)
-
-    # Clean + validate; identity is the canonical product_url, so a repeat counts once.
-    good: dict[str, dict] = {}
-    invalid: list[dict] = []
-    for raw in records:
-        try:
-            book = Book(**clean_record(raw))
-        except (ValidationError, ValueError) as exc:
-            reason = (
-                "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
-                if isinstance(exc, ValidationError) else str(exc)
-            )
-            invalid.append({"product_url": raw.get("product_url"), "stage": "validate",
-                            "error": reason, "record": raw})
+        html = fetch_or_cache(product_url, detail_cache)
+        if html is None:
+            errors.append({"product_url": product_url, "error": "Detail page fetch failed"})
             continue
-        good.setdefault(book.product_url, book.model_dump())
+        try:
+            records.append(extract_raw_record(html, product_url, source_page))
+        except (ValueError, AttributeError, IndexError) as exc:
+            errors.append({"product_url": product_url, "error": str(exc)})
+            print(f"EXTRACT FAILED {product_url}: {exc}")
 
-    books = sorted(good.values(), key=lambda b: b["product_url"])
-    state["valid"], state["invalid"] = len(books), len(invalid)
+    output_path = RAW_DIR / "raw_records.json"
+    output_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    (RAW_DIR / "errors.json").write_text(json.dumps(errors, indent=2), encoding="utf-8")
 
-    # Files are rewritten from scratch each run (never appended) -> idempotent.
-    (RAW_DIR / "raw_records.json").write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
-    (OUTPUT_DIR / "books.json").write_text(
-        json.dumps(books, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (OUTPUT_DIR / "errors.json").write_text(
-        json.dumps(failures + invalid, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
+    print(f"detail_pages={len(records)}")
     print(f"raw_records={len(records)}")
-    print(f"valid_books={len(books)}")
-    print(f"invalid_records={len(invalid)}")
-    print(f"failed_pages={len(failures)}")
+    print(f"errors={len(errors)}")
+    if records:
+        print("SAMPLE RAW RECORD:")
+        print(json.dumps(records[0], indent=2, ensure_ascii=False))
 
-    # Non-zero only if the real job fell short; known-bad extras don't fail the run.
-    return 0 if catalogue_pages == 3 and len(books) == 60 else 1
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    started = datetime.now(timezone.utc)
-    t0 = time.monotonic()
-    state = {"catalogue_pages": 0, "valid": 0, "invalid": 0, "failed": 0}
-    crashed: str | None = None
-    code = 1
-    try:
-        code = run(args.extra_url, state)
-    except Exception as exc:  # noqa: BLE001 - still report, then exit non-zero
-        crashed = f"{type(exc).__name__}: {exc}"
-        print(f"RUN CRASHED: {crashed}")
-    finally:
-        write_report(started, t0, state["valid"], state["invalid"], state["failed"],
-                     state["catalogue_pages"], crashed)
-    return code
+    # Exit nonzero when the checkpoint was not actually achieved.
+    return 0 if catalogue_pages == 3 and len(records) == 60 and not errors else 1
 
 
 if __name__ == "__main__":

@@ -30,20 +30,3 @@ errors=0
 ```
 
 The script prints one complete sample record. Counts are measured from the pages actually fetched or cached; they are not hardcoded. A partial run exits with a nonzero status.
-
-## Stage 4 — Clean, check, store
-
-- `src/schema.py` defines the `Book` Pydantic model. Required: `title`, `product_url`, `price_text`, `price_gbp` (float), `availability_text`, `rating_text`, `source_page`, `fetched_at`. Optional: `description`. URLs must start with `https://`.
-- `price_text` (`"£51.77"`) is kept as-is next to the clean number `price_gbp` (`51.77`).
-- `product_url` (absolute, canonical) is each record's identity; duplicates count once.
-- Every record is validated before storing. Failures go to `output/errors.json` with the reason and never into `output/books.json`.
-- Idempotent: output files are rewritten from scratch (never appended), records are sorted by `product_url`, and `fetched_at` is the page's cache time, so a second run produces byte-identical output with 60 records, not 120.
-
-Output: `output/books.json`, `output/errors.json`.
-
-## Stage 5 — Resilience and run report
-
-- Every book page is handled separately; a failed page is logged to `output/errors.json` (with `stage` and `error`) and skipped.
-- Timeouts, connection errors and 5xx responses are retried once after a short wait. 404, 403 and other 4xx are never retried.
-- Every run ends by writing `output/run-report.json`: `start_time`, `duration_seconds`, `pages_fetched`, `cache_hits`, `retries`, `valid_records`, `invalid_records`, `failed_pages` (plus `catalogue_pages` and `crashed`). It is written even if the run crashes.
-- Test failure on your side only: `python src/main.py --extra-url https://books.toscrape.com/catalogue/made-up-book_1/index.html`. Expect `failed_pages: 1`, 60 valid books and exit code 0. (A made-up URL on the real site costs one request, since a 404 isn't retried. Repeating it with a cache in place is not needed.)
